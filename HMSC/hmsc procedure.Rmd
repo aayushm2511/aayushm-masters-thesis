@@ -1,0 +1,523 @@
+---
+title: "hmsc procedure"
+output: html_document
+date: "2025-09-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction ##
+
+This markdown file will go over every step of the Hmsc modelling framework as laid out by Ovaiskainen et al., 2020. All modelling choices will be explained and code for the same will be included.
+
+## Data  ##
+```{r}
+library(tidyr)
+library(dplyr)
+
+wd = "C:/Users/lab23-user/Desktop/aayush_m/hmsc"
+
+setwd(wd)
+
+localDir = "."
+data.directory = file.path(localDir, "data")
+model.directory = file.path(localDir, "models")
+
+raw_data <- read.csv("C:/Users/lab23-user/Desktop/aayush_m/gams/data/geb13350-sup-0002-tree-species-occ.csv") 
+raw_longitudes <- raw_data$Longitude
+raw_latitudes <- raw_data$Latitude
+raw_CWD <- raw_data$CWD
+raw_site <- raw_data$Plot_ID
+
+spatial_data <- data.frame(Longitude = unlist(raw_longitudes), Latitude = unlist(raw_latitudes), CWD = unlist(raw_CWD),Site = unlist(raw_site))
+spatial_data <- spatial_data %>% group_by(Site) %>% summarise(X = mean(Longitude), Y = mean(Latitude), CWD = mean(CWD))
+colnames(spatial_data) <- c("Site", "Longitude", "Latitude", "CWD")
+
+```
+## Defining the model ##
+
+The file final_data.csv contains species counts for 691 species in 286 sites located across the Western Ghats. We load this file in and examine the data, extracting site and species names for later use. 
+
+```{r}
+library(Hmsc)
+
+
+data = read.csv(file=file.path(data.directory,"final_data.csv"), stringsAsFactors=TRUE, strip.white = TRUE)
+data$site = factor(data$site)
+sites = levels(data$site)
+species = levels(data$species)
+head(data)
+
+```
+
+We then move on to building all the various components that HMSC requires.
+
+```{r}
+
+#site by species matrix
+Y <- data %>% select(site, species, value) %>% pivot_wider(names_from = species, values_from = value,values_fn = sum, values_fill = list(val=0))
+Ynames <- Y$site
+Y <- Y %>% select(-site)
+Y <- data.frame(lapply(Y, as.numeric))
+rownames(Y) <- Ynames
+
+
+Y <- Y[,-which(colSums(Y) < 10)] #removing species with less than 10 individuals across the WG, 363 species are left after this step 
+colnames(Y) <- gsub("\\.", " ", colnames(Y))
+
+species <- colnames(Y)
+head(Y)
+#CWD values
+cwd <- data %>%  group_by(site) %>% summarise(CWD = mean(env))
+XData = data.frame(CWD = cwd$CWD)
+
+```
+
+Constructing the phylogenetic tree
+
+```{r}
+library(rgbif)
+library(purrr)
+species_list <- c(species)
+get_family <- function(sp) {
+  out <- tryCatch(name_backbone(name = sp), error = function(e) NULL)
+  
+  if (is.null(out) || length(out) == 0) {
+    return(NA_character_)
+  }
+  
+  return(out$family %||% NA_character_)  # family name or NA
+}
+families <- map_chr(species_list, get_family)
+print(families)
+
+df <- data.frame(
+  family = c(families),
+  fullname = c(species),
+  stringsAsFactors = FALSE
+)
+
+
+
+
+species2<- df %>%
+  separate(fullname, into = c("genus", "species_epithet"), sep = " ", extra = "merge") %>%
+  mutate(species = paste(genus, species_epithet)) %>%
+  select(species, genus, family)
+
+#adding in a few family names manually
+species2$family[which(species2$species == "Ficus nervosa")] <-  "Moraceae"
+species2$family[which(species2$species == "Euodia lunu ankenda")] <-  "Rutaceae"
+species2$family[which(species2$species == "Mallotus aureo punctatus")] <-  "Euphorbiaceae"
+species2 <- na.omit(species2)
+
+
+#TREE
+library(V.PhyloMaker)
+
+library(phytools)
+library(ape)
+tree_result <- phylo.maker(
+  sp.list = species2,
+  tree    = GBOTB.extended,
+  nodes   = nodes.info.1,  
+  scenarios = "S3"         
+)
+my_tree <- tree_result$scenario.3
+my_tree <- force.ultrametric(my_tree, method = "nnls")
+my_tree$tip.label <- gsub("_", " ", my_tree$tip.label)
+plot.phylo(my_tree, type = "tidy")
+write.tree(my_tree, file = "my_tree_atleast10.phylo") #tree is saved, only need to run this chunk once
+```
+
+```{r}
+XFormula = ~poly(CWD, degree = 2, raw = TRUE) # Occurrence assumed to be a 2-degree function of CWD
+
+Ypa <- 1*(Y>0) #data truncated to presence-absence
+
+colnames(Ypa) <- gsub("\\.", " ", colnames(Ypa) )
+
+Yab <- Y
+Yab[Yab == 0] <- NA
+Yab <- log(Yab) #data for the abundance model
+colnames(Yab) <- gsub("\\.", " ", colnames(Yab) )
+
+```
+
+```{r}
+library(ape)
+my_tree <- read.tree("my_tree.phylo") #loading in the tree
+my_tree$tip.label <- gsub("_", " ", my_tree$tip.label)
+my_tree$tip.label <- gsub("-", " ", my_tree$tip.label)
+
+#building the model as per the book
+
+#PA model
+model.pa <- Hmsc(Y=Ypa, XData = XData, XFormula=XFormula,
+         phyloTree = my_tree, 
+         distr="probit"
+         )
+
+# Abundance (conditional on presence) model
+model.ab <-  Hmsc(Y=Yab, YScale = T, XData = XData, XFormula=XFormula,
+            phyloTree = my_tree,
+            distr="normal"
+            )
+```
+
+## Fitting the model ##
+
+
+```{r}
+
+
+samples = 250
+nChains = 4
+thin = 10
+transient = 0.5*samples*thin
+verbose = 100
+
+model.pa = sampleMcmc(model.pa, thin = thin, samples = samples, transient = transient, nChains = nChains, verbose = verbose, nParallel = nChains)
+filename = file.path(model.directory,
+                     paste0("model_pa_chains_",as.character(nChains),"_samples_",as.character(samples),"_thin_",as.character(thin)))
+save(model.pa, file="model_pa_final") #presence-absence model
+
+```
+
+```{r}
+model.ab = sampleMcmc(model.ab, thin = thin, samples = samples, transient = transient, nChains = nChains, verbose = verbose, nParallel = nChains)
+filename = file.path(model.directory,
+                     paste0("model_ab_chains_",as.character(nChains),"_samples_",as.character(samples),"_thin_",as.character(thin)))
+save(model.ab, file="model_ab_final") #abundance model
+
+```
+
+```{r}
+library(Hmsc)
+load(("C:/Users/lab23-user/Desktop/aayush_m/hmsc/models/model_pa_final"))
+load(("C:/Users/lab23-user/Desktop/aayush_m/hmsc/models/model_ab_final"))
+
+model.pa <- model.pa
+model.ab <- model.ab
+```
+
+```{r}
+
+
+pa.coda <- convertToCodaObject(model.pa)
+ab.coda <- convertToCodaObject(model.ab)
+
+psrf_pa <- gelman.diag(pa.coda$Beta, multivariate = FALSE)$psrf #model diagnostics, most of these should be close to 1
+psrf_ab <- gelman.diag(ab.coda$Beta, multivariate = FALSE)$psrf
+par(mfrow=c(1,2))
+hist(psrf_pa)
+hist(psrf_ab)
+
+predYpa <- computePredictedValues(model.pa, expected = FALSE, thin = 1)
+predYab <- computePredictedValues(model.ab, expected = TRUE, thin = 1)
+
+mfpa <- evaluateModelFit(model.pa, predY = predYpa)
+mfab <- evaluateModelFit(model.ab, predY = predYab)
+```
+## Further analysis ##
+
+I use the presence-absence model to obtain the probability of occurrence curves across the CWD gradient for each species. These are then used to calculate the divergence response diversity at each site. The PA model is then 'hurdled' with the abundance model in order to estimate species diversity measures. 
+
+First, response diversity:
+```{r}
+
+k <- data.frame(matrix(data = sort(unique(model.pa$XData[[1]]))))
+colnames(k) <- c("CWD")
+
+
+
+pred2 <- predict(model.pa, XData=k, expected = TRUE)
+
+
+pred_array_raw <- simplify2array(pred2)   
+
+
+
+
+# permute so [species x gradient x draws]
+pred_array <- aperm(pred_array_raw, c(2,1,3))
+
+
+
+
+
+# cwd vals to use when predicting at original CWD Vals
+grad <- data.frame(unique(model.pa$XData[[1]]))
+grad <- grad[[1]]
+grad<-sort(grad)
+
+
+
+
+
+# numerical derivative
+ng <- length(grad) 
+ns <- dim(pred_array)[1]
+
+nd <- dim(pred_array)[3]
+
+dCWD <- diff(grad)
+mid  <- (grad[-1] + grad[-ng]) / 2  
+
+
+dP <- array(NA_real_, dim = c(ns, ng-1, nd))
+
+
+for (i in 1:nd){
+  pred_array[,,i] <- as.numeric(pred_array[,,i])
+}
+
+for(l in 1:nd){
+  dP[,,l] <- t(apply(pred_array[,,l], 1, function(p) diff(p) / dCWD))
+}
+
+# posterior summary
+dP_mean <- apply(dP, c(1,2), mean)
+
+
+
+sp <- 278 #test plot
+
+plot(mid, dP_mean[sp,], type="l", lwd=2,
+     col = "blue",
+     xlab="CWD", ylab="d(Prob)/dCWD",
+     main=model.pa$spNames[sp])
+
+
+abline(h=0, lty=3)
+
+
+divs <- data.frame(matrix(data = "", ncol = 2, nrow = ncol(dP_mean)))
+colnames(divs) <- c("RD", "CWD")
+
+
+
+for (i in 1:ncol(dP_mean)){
+  slice <- dP_mean[,i]
+  h <- max(slice)
+  l <- min(slice)
+  divergence <- ((h-l) - abs(abs(h) - abs(l)))/(h-l) #divergence aspect of RD
+  #imbalance <- abs(mean(slice)) #imbalance aspect of RD
+  divs[i,1] <- divergence
+  divs[i,2] <- grad[i]
+
+}
+
+divs <- data.frame(divs)
+divs$RD <- as.numeric(divs$RD)
+divs$CWD <- as.numeric(divs$CWD)
+plot(divs$CWD, divs$RD, xlab = "CWD", ylab = "Divergence")
+
+```
+
+The hurdle model to estimate different species diversity measures across the Western Ghats:
+
+```{r}
+
+library(vegan)
+predYpa <- computePredictedValues(model.pa, expected = FALSE, thin = 1)
+predYab <- computePredictedValues(model.ab, expected = TRUE, thin = 1)
+predHurdle <- predYpa * exp(predYab) #following Weigel et al., 2021
+meanpredHurdle <- apply(predHurdle, c(1,2), mean)
+
+meanshan <- vegan::diversity(meanpredHurdle, index = "shannon", MARGIN = 1) #shannon diversity - hurdle
+shan <- data.frame(shannon_di = meanshan, CWD = model.ab$XData[[1]])
+meanrare <- rarefy(round(meanpredHurdle), sample = 31, MARGIN = 1) #rareified richness - hurdle
+rare <- data.frame(rareified = meanrare, CWD = model.ab$XData[[1]])
+
+
+
+pred4 <- predict(model.pa, XData = k, expected = TRUE)
+pred4 <- simplify2array(pred4)
+pred4 <- aperm(pred4, c(2,1,3))
+
+rownames(pred4) <- model.pa$spNames
+
+#two ways to generate confidence intervals for predictions - ended up using neither
+
+lci_wcox <- function(array){
+  w <- wilcox.test(array, conf.int = TRUE, conf.level = 0.95)
+  return(w$conf.int[1])
+}
+
+library(bayestestR)
+lci_bayes <- function(array){
+  b <- ci(array, method = "HDI")
+  return(b$CI_low)
+}
+
+
+#lowers_wcox <- apply(pred4, c(1,2), lci_wcox)
+lowers_bayes <-apply(pred4, c(1,2), lci_bayes)
+
+
+threshold <- 0.01
+#comm_w <- 1*(lowers_wcox > threshold)
+comm_b <- 1*(lowers_bayes > threshold)
+lci <- data.frame(lci_rich = colSums(comm_b), CWD = k) # species richness based on solely the PA model - when the lower CI of the occurrence probability of a species at a site is > threshold, it counts towards richness
+
+
+
+#plot(m$XData[[1]], colSums(comm_w))
+
+
+
+pred_r <- apply(pred4, c(1,2), mean)
+pred_ri <- 1*(pred_r > threshold)
+mean_ri <- data.frame(mean_rich = colSums(pred_ri), CWD = k)  # same as above but for mean probability instead of lci
+
+diversity_dataframe <- Reduce(function(x, y) merge(x, y, all=TRUE), list(mean_ri, lci, shan ,rare, divs))
+diversity_dataframe[nrow(diversity_dataframe),ncol(diversity_dataframe)] <- diversity_dataframe[nrow(diversity_dataframe)-1,ncol(diversity_dataframe)]
+d <- diversity_dataframe %>% group_by(CWD) %>% summarise(ri = mean(mean_rich), lci = mean(lci_rich), shan = mean(shannon_di), rare = mean(rareified), rd = mean(RD, na.rm= TRUE))
+
+#only used rareified richness and shannon diversity as diversity measures
+
+
+cor(d$rd, d$rare)
+
+
+par(mfrow = c(2,1))
+
+#note - rareified and shannon are sufficient
+plot(d$CWD, d$rare, xlab = "CWD", ylab = "Rareified richness")
+#plot(d$CWD, d$ri)
+plot(d$CWD, d$shan, xlab = "CWD", ylab = "Shannon diversity")
+#plot(d$CWD, d$lci)
+
+
+```
+
+## Statistical analysis
+
+For the purposes of establishing the RD-diversity relationship, I will use RD as determined by the SSDM method and diversity measures from the hurdle model - specifically Shannon diversity and rareified richness. Diversity metrics from the raw data will also be calculated. 
+
+```{r}
+library(infotheo)
+library(GGally)
+library(reshape2)
+
+rd.analysis <- rd_at_site %>% group_by(CWD) %>% summarise(RD = mean(RD)) #referencing the GAM-generated RD matrix to enable comparison across modelling approaches
+
+final<- merge(rd.analysis, d, by = "CWD")
+final <- final[,-c(3,4,7)] #removing unnecessary columns 
+colnames(final) <- c("CWD", "RD_gams","shan", "rare")
+
+
+final2 <- final[-143,] #since derivatives were numerically obtained, it ends up with n - 1 values, where n is unique number of CWD valuess (143), and so i delete one record from the matrix. in practice it does not affect the analysis regardless of the row chosen (either first or last)
+
+final2 <- merge(final2, divs, by = "CWD")
+final2 <- final2[,-2]
+colnames(final2) <- c("CWD", "shan", "rare", "RD_hmsc")
+
+
+#code below deals with diversity measures on the raw dataset - ended up unused in analysis
+rareraw <- rarefy(Y, sample = min(rowSums(Y)), MARGIN = 1)
+rareraw <- data.frame(rareraw = rareraw, Site = names(rareraw))
+shanraw <- diversity(Y, index = "shannon", MARGIN = 1)
+shanraw <- data.frame(shanraw = shanraw, Site = names(shanraw))
+divraw <- merge(rareraw, shanraw, by = "Site")
+
+cwdraw <- merge(divraw, rd_at_site, by = "Site")
+cwdraw <- cwdraw[,-c(5,6,7)]
+cwdraw <- cwdraw %>% group_by(CWD) %>% summarise(rareraw = mean(rareraw), shanraw = mean(shanraw))
+cwdraw <- cwdraw[-143,]
+
+
+rawfinal <- merge(final2, cwdraw, by= "CWD")
+rawfinal <- rawfinal[,-c(2,3)]
+rawfinal <- merge(rawfinal, final, by = "CWD")
+rawfinal <- rawfinal[,-c(6,7)]
+finalfinal <- rawfinal
+finalfinal$hm_shan <- final2$shan
+finalfinal$hm_rare <- final2$rare
+
+#final result - contains RD as estimated by HMSC, by GAMs, CWD values, and diversity measures from the HMSC Hurdle model
+result <- finalfinal %>% select(CWD,hm_rare, hm_shan,  RD_hmsc)
+
+
+
+
+
+cor.test(result$RD_hmsc, result$hm_rare)
+cor.test(result$RD_hmsc, result$hm_shan)
+
+
+
+#plotting stuff
+corr_mat <- cor(result)
+info_mat <- mutinformation(discretize(result))/max(mutinformation(discretize(result)))
+
+get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+}
+
+melted_corr <- melt(get_lower_tri(corr_mat), na.rm = TRUE)
+melted_info <- melt(get_lower_tri(info_mat), na.rm = TRUE)
+
+par(mfrow =c(1,2))
+
+ggheatmap_corr <- ggplot(melted_corr, aes(Var1, Var2, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+    name="Pearson\nCorrelation") +
+  theme_minimal()+ # minimal theme
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+
+ggheatmap_corr + 
+
+geom_text(aes(Var1, Var2, label = round(value, digits = 2)), color = "black", size = 4) +
+theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks = element_blank(),
+  legend.justification = c(1.2, 0),
+  legend.position = c(0.55, 0.7),
+  legend.direction = "horizontal")+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                title.position = "top", title.hjust = 0.5))
+
+
+
+  
+ggheatmap_info <- ggplot(melted_info, aes(Var1, Var2, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(high = "red", low = "blue",
+   midpoint = 0.5, limit = c(0,1), space = "Lab", 
+    name="Mutual\nInformation") +
+  theme_minimal()+ # minimal theme
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+
+ggheatmap_info + 
+geom_text(aes(Var1, Var2, label = round(value, digits = 2)), color = "black", size = 4) +
+theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks = element_blank(),
+  legend.justification = c(1.2, 0),
+  legend.position = c(0.55, 0.7),
+  legend.direction = "horizontal")+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 0.6,
+                title.position = "top", title.hjust = 0.5))
+
+
+
+```
