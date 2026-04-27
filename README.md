@@ -9,7 +9,7 @@ Code files:
 
 3.) sensitivity_analysis - code to re-run imbalance calculations using only species with significant CWD terms in the GAM (88/183).
 
-4.) CWD_bin_geography_checl - code to check within-group spatial spread of CWD groups (ref. Section 2.1).
+4.) CWD_bin_geography_check - code to check within-group spatial spread of CWD groups (ref. Section 2.1).
 
 5.) Temporal_variability.R - code to estimate temporal variability in Enhanced Vegetation Index following White et al., 2020, pertaining to section 2.3 of the thesis
 
